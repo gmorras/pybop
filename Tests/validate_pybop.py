@@ -10,7 +10,7 @@ import sys
 sys.path.append('../pybop')
 from optimization import (
     _matern52,
-    _compute_r2_and_r2per,
+    _compute_r2,
     GaussianProcess,
     bayesian_minimization,
 )

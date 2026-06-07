@@ -136,14 +136,24 @@ def _generate_Sobol_samples(
 # Distance helper: supports both standard and periodic dimensions
 # ---------------------------------------------------------------------------
 
-def _compute_r2_and_r2per(X1: np.ndarray, X2: np.ndarray,
-                           length_scale: np.ndarray,
-                           periodic_dims: list[int],
-                           periods_norm: np.ndarray) -> tuple:
+def _compute_r2(X1: np.ndarray, X2: np.ndarray,
+                length_scale: np.ndarray,
+                periodic_dims: list[int] | None = None,
+                periods_norm:  np.ndarray | None = None) -> np.ndarray:
     """
-    Compute the squared distance r2 = sum_k d_k^2 and per-dimension d_k^2,
-    where for normal dims  d_k = (x1_k - x2_k) / ls_k
-    and for periodic dims  d_k = 2*sin(pi*(x1_k - x2_k)/T_k) / ls_k
+    Pairwise squared (locally-periodic ARD) Matérn distance r2[i, j] between
+    rows of X1 (n1, d) and X2 (n2, d), in normalised space.
+
+    The squared distance is accumulated one dimension at a time, forming the
+    pairwise differences *before* squaring:
+
+        r2[i, j] = Σ_k ( δ_k(x1_i, x2_j) / ls_k )²
+
+    where δ_k is the raw difference (x1_k - x2_k) for standard dims and the
+    locally-periodic difference 2·sin(π(x1_k - x2_k)/T_k) for periodic dims.
+    Differencing before squaring keeps the result numerically stable for
+    nearby points.  Only one (n1, n2) buffer is held per dimension, so no
+    (n1, n2, d) difference tensor is materialised.
 
     Parameters
     ----------
@@ -151,30 +161,31 @@ def _compute_r2_and_r2per(X1: np.ndarray, X2: np.ndarray,
     length_scale   : (d,)
     periodic_dims  : list of dimension indices that are periodic
     periods_norm   : (d,) effective period in normalised space
-                     (ignored for non-periodic dims)
+                     (only entries at periodic_dims are used)
 
     Returns
     -------
-    diff    : (n1, n2, d)  raw difference x1 - x2 (useful for gradient)
-    r2_per  : (n1, n2, d)  per-dim *scaled* squared distance  d_k^2
-    r2      : (n1, n2)     total squared distance
+    r2 : (n1, n2) total squared distance (≥ 0 by construction).
     """
-    diff   = X1[:, None, :] - X2[None, :, :]          # (n1, n2, d)
-    r2_per = (diff / length_scale) ** 2                # standard contribution
+    periodic_dims = periodic_dims or []
+    per_set       = set(periodic_dims)
 
-    for k in periodic_dims:
-        T_k = periods_norm[k]
-        # periodic distance:  2 sin(pi * delta / T)
-        pd           = 2.0 * np.sin(np.pi * diff[:, :, k] / T_k)
-        r2_per[:, :, k] = (pd / length_scale[k]) ** 2
-
-    r2 = r2_per.sum(axis=-1)
-    return diff, r2_per, r2
+    r2 = np.zeros((X1.shape[0], X2.shape[0]))
+    for k in range(X1.shape[1]):
+        delta = X1[:, k][:, None] - X2[:, k][None, :]    # (n1, n2)
+        if k in per_set:
+            delta = 2.0 * np.sin((np.pi / periods_norm[k]) * delta)
+        delta /= length_scale[k]
+        r2 += delta * delta
+    return r2
 
 
 # ---------------------------------------------------------------------------
 # Matérn 5/2 kernel  (ARD, with optional periodic dimensions)
 # ---------------------------------------------------------------------------
+
+_SQRT5 = float(np.sqrt(5.0))
+
 
 def _matern52(X1: np.ndarray, X2: np.ndarray,
               length_scale: np.ndarray, variance: float,
@@ -184,26 +195,19 @@ def _matern52(X1: np.ndarray, X2: np.ndarray,
     Matérn 5/2 covariance matrix between rows of X1 (n1, d) and X2 (n2, d).
 
     For periodic dimensions the Euclidean difference |x1_k - x2_k| is
-    replaced by  2|sin(π·Δ/T_k)|  — this is the standard 'locally periodic
-    Matérn' construction and preserves positive-definiteness.
+    replaced by  2|sin(π·Δ/T_k)|  — the standard 'locally periodic Matérn'
+    construction, which preserves positive-definiteness.  The squared
+    distance is delegated to :func:`_compute_r2`.
 
     length_scale : (d,)  — one scale per dimension (ARD)
     periodic_dims: list of int — indices of periodic dimensions
     periods_norm : (d,)  — period per dim in normalised space
                            (only entries at periodic_dims are used)
     """
-    if periodic_dims is None:
-        periodic_dims = []
-
-    if not periodic_dims:
-        diff = X1[:, None, :] - X2[None, :, :]
-        r2   = np.sum((diff / length_scale) ** 2, axis=-1)
-    else:
-        _, _, r2 = _compute_r2_and_r2per(X1, X2, length_scale,
-                                          periodic_dims, periods_norm)
-
-    r = np.sqrt(np.maximum(r2, 0.0))
-    return variance * (1.0 + np.sqrt(5.0) * r + 5.0 / 3.0 * r2) * np.exp(-np.sqrt(5.0) * r)
+    r2      = _compute_r2(X1, X2, length_scale, periodic_dims, periods_norm)
+    r       = np.sqrt(r2)
+    sqrt5_r = _SQRT5 * r
+    return variance * (1.0 + sqrt5_r + (5.0 / 3.0) * r2) * np.exp(-sqrt5_r)
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +293,7 @@ class GaussianProcess:
 
         self.X_train_: np.ndarray | None = None
         self.y_train_: np.ndarray | None = None
+        self._pd_train: np.ndarray | None = None
         self._L:     np.ndarray | None = None
         self._alpha: np.ndarray | None = None
 
@@ -348,10 +353,17 @@ class GaussianProcess:
     # Log-marginal likelihood with analytic gradients
     # ------------------------------------------------------------------
 
-    def _log_marginal_likelihood(self, log_params: np.ndarray) -> tuple:
+    def _log_marginal_likelihood(self, log_params: np.ndarray,
+                                 compute_grad: bool = True):
         """
         Negative log-marginal likelihood and its analytic gradient w.r.t.
         log-hyperparameters.
+
+        When ``compute_grad`` is False only the (scalar) negative log-marginal
+        likelihood is returned and the gradient is not evaluated.  This is used
+        by the hyperparameter screening phase, which discards the gradient, and
+        avoids the O(n³) ``K⁻¹`` solve plus the per-dimension gradient sums.
+        The returned value is identical to ``...(log_params)[0]``.
 
         Matérn 5/2 partial derivatives
         --------------------------------
@@ -379,70 +391,58 @@ class GaussianProcess:
         ls    = np.exp(log_params[:d])
         var   = np.exp(log_params[d])
         noise = 0.0 if self.deterministic else np.exp(log_params[d + 1])
-        X, y  = self.X_train_, self.y_train_
+        y     = self.y_train_
         n     = len(y)
+        n_params = d + 1 if self.deterministic else d + 2
 
-        # Build kernel with current params (temporarily override self attrs)
-        _ls_old, _var_old = self.length_scale_, self.variance_
-        self.length_scale_, self.variance_ = ls, var
-        K = self._kernel_matrix(X, X) + (noise + self.jitter) * np.eye(n)
-        self.length_scale_, self.variance_ = _ls_old, _var_old
+        def _logp(L):
+            alpha_L = solve_triangular(L, y,         lower=True,  check_finite=False)
+            alpha   = solve_triangular(L.T, alpha_L, lower=False, check_finite=False)
+            log_lik = (
+                -0.5 * y @ alpha
+                - np.sum(np.log(np.diag(L)))
+                - 0.5 * n * np.log(2.0 * np.pi)
+            )
+            return alpha, log_lik
+
+        # Squared distances from the pre-computed effective differences
+        # (hyperparameter-independent; built once per fit).  Fall back to
+        # computing them on demand if the method is used without a prior fit.
+        pd = self._pd_train
+        if pd is None:
+            pd = self._effective_differences(self.X_train_)
+        r2_per   = (pd / ls) ** 2                         # (n, n, d)
+        r2       = r2_per.sum(axis=-1)                    # (n, n)
+        r        = np.sqrt(r2)
+        exp_r    = np.exp(-_SQRT5 * r)
+        K_signal = var * (1.0 + _SQRT5 * r + 5.0 / 3.0 * r2) * exp_r
+        K        = K_signal.copy()
+        K[np.diag_indices(n)] += noise + self.jitter
 
         try:
             L = np.linalg.cholesky(K)
         except np.linalg.LinAlgError:
-            n_params = d + 1 if self.deterministic else d + 2
-            return 1e10, np.zeros(n_params)
+            return (1e10, np.zeros(n_params)) if compute_grad else 1e10
 
-        alpha_L = solve_triangular(L, y,         lower=True)
-        alpha   = solve_triangular(L.T, alpha_L, lower=False)
+        alpha, log_lik = _logp(L)
 
-        log_lik = (
-            -0.5 * y @ alpha
-            - np.sum(np.log(np.diag(L)))
-            - 0.5 * n * np.log(2.0 * np.pi)
-        )
+        # ---- Value-only path (hyperparameter screening) ----
+        if not compute_grad:
+            return -log_lik
 
-        L_inv = solve_triangular(L, np.eye(n), lower=True)
+        L_inv = solve_triangular(L, np.eye(n), lower=True, check_finite=False)
         K_inv = L_inv.T @ L_inv
         W     = np.outer(alpha, alpha) - K_inv
 
-        # ---- Distances in normalised space for current ls ----
-        diff   = X[:, None, :] - X[None, :, :]           # (n, n, d)
-
-        # Per-dim scaled squared distance (periodic or standard)
-        r2_per = np.zeros((n, n, d))
-        for k in range(d):
-            if k in self.periodic_dims:
-                idx = self.periodic_dims.index(k)
-                T_k = self._periods_norm[k]
-                pd  = 2.0 * np.sin(np.pi * diff[:, :, k] / T_k)
-                r2_per[:, :, k] = (pd / ls[k]) ** 2
-            else:
-                r2_per[:, :, k] = (diff[:, :, k] / ls[k]) ** 2
-
-        r2     = r2_per.sum(axis=-1)                      # (n, n)
-        r      = np.sqrt(np.maximum(r2, 0.0))
-        exp_r  = np.exp(-np.sqrt(5.0) * r)
-
-        n_params = d + 1 if self.deterministic else d + 2
         grad = np.empty(n_params)
 
-        # dK/d(log ls_k):
-        #   K = var * (1 + √5 r + 5/3 r²) * exp(-√5 r)
-        #   dr²/d(log ls_k) = -2 * r2_per_k  (log-space chain rule)
-        #   dr/d(log ls_k)  = -r2_per_k / r  (where r > 0)
-        #   dK/d(log ls_k)  = var * exp(-√5r) * (5/3) * (1 + √5r) * r2_per_k
-        #      (the sign works out because d/d(log ls) ls^{-2} = -2 ls^{-2})
-        for k in range(d):
-            dK_dlsk = var * exp_r * (5.0 / 3.0) * (1.0 + np.sqrt(5.0) * r) * r2_per[:, :, k]
-            grad[k] = -0.5 * np.sum(W * dK_dlsk)
-
-        K_signal = K - (noise + self.jitter) * np.eye(n)
+        # dK/d(log ls_k) = var·exp(-√5r)·(5/3)·(1+√5r)·r2_per_k  (log-space chain
+        # rule); all d derivatives are contracted against W in a single einsum.
+        WC = W * (var * exp_r * (5.0 / 3.0) * (1.0 + _SQRT5 * r))
+        grad[:d] = -0.5 * np.einsum("ij,ijk->k", WC, r2_per)
         grad[d]  = -0.5 * np.sum(W * K_signal)
-
         if not self.deterministic:
-            grad[d + 1] = -0.5 * np.sum(W * (noise * np.eye(n)))
+            grad[d + 1] = -0.5 * noise * np.trace(W)
 
         return -log_lik, grad
 
@@ -466,7 +466,8 @@ class GaussianProcess:
             seed       = int(self.rng.randint(0, 2**31 - 1)),
         )
         screen_vals = np.array([
-            self._log_marginal_likelihood(pt)[0] for pt in screen_pts
+            self._log_marginal_likelihood(pt, compute_grad=False)
+            for pt in screen_pts
         ])
         best_screen_idx = np.argpartition(screen_vals, self.n_restarts)[:self.n_restarts]
         best_starts     = screen_pts[best_screen_idx]
@@ -494,8 +495,8 @@ class GaussianProcess:
         K    = self._kernel_matrix(X, X)
         K   += (self.noise_variance_ + self.jitter) * np.eye(n)
         self._L = np.linalg.cholesky(K)
-        v = solve_triangular(self._L, y, lower=True)
-        self._alpha = solve_triangular(self._L.T, v, lower=False)
+        v = solve_triangular(self._L, y, lower=True, check_finite=False)
+        self._alpha = solve_triangular(self._L.T, v, lower=False, check_finite=False)
 
     # ------------------------------------------------------------------
     # Public API
@@ -562,12 +563,31 @@ class GaussianProcess:
         self.X_train_ = Xn
         self.y_train_ = residuals
 
+        # Per-dimension "effective differences" of the training set depend only
+        # on the (fixed) inputs and periods, not on the hyperparameters, so we
+        # build them once here and reuse them across every likelihood evaluation
+        # in the hyperparameter optimisation instead of rebuilding the
+        # (n, n, d) difference tensor each call.
+        self._pd_train = self._effective_differences(Xn)
+
         if self.length_scale_ is None:
             self.length_scale_ = np.ones(d)
 
         self._optimise_hyperparams()
         self._build_cholesky()
         return self
+
+    def _effective_differences(self, X: np.ndarray) -> np.ndarray:
+        """
+        Per-dimension differences between all training pairs, shape (n, n, d):
+        the raw difference x_i - x_j for standard dims, and the locally-periodic
+        2·sin(π(x_i - x_j)/T_k) for periodic dims.  Dividing by the length
+        scale and squaring then yields the per-dim squared distance.
+        """
+        pd = X[:, None, :] - X[None, :, :]                       # (n, n, d)
+        for k in self.periodic_dims:
+            pd[:, :, k] = 2.0 * np.sin(np.pi * pd[:, :, k] / self._periods_norm[k])
+        return pd
 
     def predict(self, X: np.ndarray,
                 return_std: bool = False) -> np.ndarray | tuple:
@@ -587,7 +607,7 @@ class GaussianProcess:
         if not return_std:
             return mu
 
-        v        = solve_triangular(self._L, K_s, lower=True)
+        v        = solve_triangular(self._L, K_s, lower=True, check_finite=False)
         var_post = self.variance_ - np.sum(v ** 2, axis=0)
         sigma    = np.sqrt(np.maximum(var_post, 0.0))
         if self.normalize:
@@ -618,20 +638,14 @@ class GaussianProcess:
 
         diff = X_tr - xn[None, :]                              # (n_train, d)
 
-        # Per-dim scaled squared distance
-        r2_per = np.zeros((n_tr, d))
-        pd     = np.zeros((n_tr, d))   # "effective difference" per dim
+        # Per-dim "effective difference" pd_k: equal to the raw difference for
+        # standard dims, and 2·sin(π Δ/T) for periodic dims.
+        pd = diff.copy()                                      # (n_train, d)
+        for k in self.periodic_dims:
+            T_k      = self._periods_norm[k]
+            pd[:, k] = 2.0 * np.sin(np.pi * diff[:, k] / T_k)
 
-        for k in range(d):
-            if k in self.periodic_dims:
-                T_k       = self._periods_norm[k]
-                s         = 2.0 * np.sin(np.pi * diff[:, k] / T_k)
-                pd[:, k]  = s
-                r2_per[:, k] = (s / ls[k]) ** 2
-            else:
-                pd[:, k]  = diff[:, k]
-                r2_per[:, k] = (diff[:, k] / ls[k]) ** 2
-
+        r2_per   = (pd / ls) ** 2                              # (n_train, d)
         r2       = r2_per.sum(axis=-1)                         # (n_train,)
         r        = np.sqrt(np.maximum(r2, 0.0))
         exp_term = np.exp(-np.sqrt(5.0) * r)
@@ -642,28 +656,27 @@ class GaussianProcess:
         # ---- Gradient of k_s w.r.t. xn ----
         # common scalar factor per training point
         factor = (5.0 / 3.0) * var * exp_term * (1.0 + np.sqrt(5.0) * r)
-        # (n_train, d):  factor_i * (pd_ik / ls_k²) * d(pd_ik)/d(xn_k)
-        dk_dxn = np.zeros((n_tr, d))
-        for k in range(d):
-            if k in self.periodic_dims:
-                T_k = self._periods_norm[k]
-                # d(2 sin(π Δ/T))/d(xn) = 2π/T · cos(π Δ/T)
-                dpd_dxn   = (2.0 * np.pi / T_k) * np.cos(np.pi * diff[:, k] / T_k)
-            else:
-                dpd_dxn = np.ones(n_tr)
+        # d(pd_k)/d(xn_k): 1 for standard dims, 2π/T·cos(π Δ/T) for periodic.
+        dpd_dxn = np.ones((n_tr, d))
+        for k in self.periodic_dims:
+            T_k           = self._periods_norm[k]
+            dpd_dxn[:, k] = (2.0 * np.pi / T_k) * np.cos(np.pi * diff[:, k] / T_k)
 
-            dk_dxn[:, k] = factor * (pd[:, k] / ls[k] ** 2) * dpd_dxn
+        # (n_train, d):  factor_i · (pd_ik / ls_k²) · d(pd_ik)/d(xn_k)
+        dk_dxn = factor[:, None] * (pd / ls ** 2) * dpd_dxn
 
         # Gradient of mean function w.r.t. normalised x
         dmu_dxn  = self._dmean_dxn() + dk_dxn.T @ self._alpha  # (d,)
 
-        # Posterior std
-        v        = solve_triangular(self._L, k_s, lower=True)
+        # Posterior std — one triangular solve for k_s and dk_dxn stacked.
+        sol      = solve_triangular(self._L, np.column_stack((k_s, dk_dxn)),
+                                    lower=True, check_finite=False)   # (n_train, 1+d)
+        v        = sol[:, 0]
+        dv_dxn   = sol[:, 1:]                                       # (n_train, d)
         var_post = max(float(var - v @ v), 1e-18)
         sigma_n  = np.sqrt(var_post)
 
-        dv_dxn    = solve_triangular(self._L, dk_dxn, lower=True)   # (n_train, d)
-        dvar_dxn  = -2.0 * dv_dxn.T @ v                             # (d,)
+        dvar_dxn   = -2.0 * dv_dxn.T @ v                            # (d,)
         dsigma_dxn = dvar_dxn / (2.0 * sigma_n)
 
         # ---- Rescale to original space ----
@@ -797,7 +810,7 @@ def bayesian_minimization(
     xi0:           float = 0.1,
     xif:           float = 1e-4,
     n_samples:     int   = 131_072,
-    batch_size:    int   = 10_000,
+    batch_size:    int   = 512,
     n_polish:      int   = 50,
     gp_kwargs:     dict | None = None,
     periodic_dims: list[int] | None = None,
