@@ -340,6 +340,7 @@ for func, label, d in TEST_FUNCTIONS:
         bounds,
         n_initial_points = N_INITIAL,
         n_calls          = N_CALLS,
+        noise            = 1e-10,      # We are using noiseless functions
     )
     t_skopt = time.time() - t0
     gap_skopt = res_skopt.fun - y_true_min
