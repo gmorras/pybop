@@ -172,11 +172,18 @@ def _compute_r2(X1: np.ndarray, X2: np.ndarray,
 
     r2 = np.zeros((X1.shape[0], X2.shape[0]))
     for k in range(X1.shape[1]):
-        delta = X1[:, k][:, None] - X2[:, k][None, :]    # (n1, n2)
         if k in per_set:
-            delta  = (2.0 / length_scale[k]) * np.sin((np.pi / periods_norm[k]) * delta)
+            # δ_k = 2·sin(π(x1-x2)/T)/ls.  Expand via the angle-difference identity
+            # sin(α-β)=sinα·cosβ-cosα·sinβ so the transcendental functions are evaluated on the
+            # 1-D coordinates (2*(n1+n2) calls) rather than on the 2-D difference matrix (n1*n2 calls).
+            f  = np.pi / periods_norm[k]
+            a1 = f * X1[:, k]
+            a2 = f * X2[:, k]
+            w  = 2.0 / length_scale[k]
+            delta = (w * np.sin(a1))[:, None] * np.cos(a2)[None, :] - (w * np.cos(a1))[:, None] * np.sin(a2)[None, :]
         else:
-            delta *= (1.0 / length_scale[k])
+            w  = 1.0 / length_scale[k]
+            delta = (w * X1[:, k])[:, None] - (w * X2[:, k])[None, :]
         r2 += delta * delta
     return r2
 
