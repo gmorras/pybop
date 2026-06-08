@@ -17,7 +17,7 @@ Licensed under the Apache-2.0 License. See the LICENSE file in the project root 
 """
 
 import numpy as np
-from scipy.linalg import solve_triangular
+from scipy.linalg import solve_triangular, cho_solve
 from scipy.optimize import minimize
 from scipy.stats import qmc
 from scipy.special import erfc
@@ -301,7 +301,7 @@ class GaussianProcess:
 
         self.X_train_: np.ndarray | None = None
         self.y_train_: np.ndarray | None = None
-        self._pd_train: np.ndarray | None = None
+        self._pd_train_sq: np.ndarray | None = None
         self._L:     np.ndarray | None = None
         self._alpha: np.ndarray | None = None
 
@@ -413,19 +413,20 @@ class GaussianProcess:
             )
             return alpha, log_lik
 
-        # Squared distances from the pre-computed effective differences
-        # (hyperparameter-independent; built once per fit).  Fall back to
-        # computing them on demand if the method is used without a prior fit.
-        pd = self._pd_train
-        if pd is None:
-            pd = self._effective_differences(self.X_train_)
-        r2_per   = (pd / ls) ** 2                         # (n, n, d)
-        r2       = r2_per.sum(axis=-1)                    # (n, n)
+        # Squared distances from the pre-computed SQUARED effective differences
+        # (hyperparameter-independent; built once per fit).  r2 is a single
+        # contraction pd_sq · ls⁻², avoiding a per-call (pd/ls)² over (n,n,d).
+        # Fall back to computing pd_sq if used without a prior fit.
+        pd_sq = self._pd_train_sq
+        if pd_sq is None:
+            pd_sq = self._effective_differences(self.X_train_) ** 2
+        inv_ls2  = 1.0 / ls ** 2                          # (d,)
+        r2       = pd_sq @ inv_ls2                         # (n,n,d)·(d,) -> (n,n)
         r        = np.sqrt(r2)
         exp_r    = np.exp(-_SQRT5 * r)
         K_signal = var * (1.0 + _SQRT5 * r + 5.0 / 3.0 * r2) * exp_r
-        K        = K_signal.copy()
-        K[np.diag_indices(n)] += noise + self.jitter
+        K        = K_signal.copy() if compute_grad else K_signal
+        K.flat[::n + 1] += noise + self.jitter           # add to diagonal in place
 
         try:
             L = np.linalg.cholesky(K)
@@ -438,17 +439,17 @@ class GaussianProcess:
         if not compute_grad:
             return -log_lik
 
-        L_inv = solve_triangular(L, np.eye(n), lower=True, check_finite=False)
-        K_inv = L_inv.T @ L_inv
+        K_inv = cho_solve((L, True), np.eye(n), check_finite=False)
         W     = np.outer(alpha, alpha) - K_inv
 
         grad = np.empty(n_params)
 
-        # dK/d(log ls_k) = var·exp(-√5r)·(5/3)·(1+√5r)·r2_per_k  (log-space chain
-        # rule); all d derivatives are contracted against W in a single einsum.
+        # dK/d(log ls_k) = var·exp(-√5r)·(5/3)·(1+√5r)·(pd_sq_k/ls_k²)  (log-space
+        # chain rule).  The 1/ls_k² factor is pulled out of the einsum so the
+        # hyperparameter-independent pd_sq is contracted against W directly.
         WC = W * (var * exp_r * (5.0 / 3.0) * (1.0 + _SQRT5 * r))
-        grad[:d] = -0.5 * np.einsum("ij,ijk->k", WC, r2_per)
-        grad[d]  = -0.5 * np.sum(W * K_signal)
+        grad[:d] = -0.5 * inv_ls2 * np.einsum("ij,ijk->k", WC, pd_sq)
+        grad[d]  = -0.5 * np.einsum("ij,ij->", W, K_signal)
         if not self.deterministic:
             grad[d + 1] = -0.5 * noise * np.trace(W)
 
@@ -571,12 +572,12 @@ class GaussianProcess:
         self.X_train_ = Xn
         self.y_train_ = residuals
 
-        # Per-dimension "effective differences" of the training set depend only
-        # on the (fixed) inputs and periods, not on the hyperparameters, so we
-        # build them once here and reuse them across every likelihood evaluation
-        # in the hyperparameter optimisation instead of rebuilding the
-        # (n, n, d) difference tensor each call.
-        self._pd_train = self._effective_differences(Xn)
+        # Per-dimension SQUARED effective differences of the training set.
+        # These depend only on the (fixed) inputs and periods, not on the
+        # hyperparameters, so squaring them once here lets every likelihood
+        # evaluation get r2 from a single contraction  r2 = pd_sq · ls⁻²
+        # instead of rebuilding (pd/ls)² over the (n, n, d) tensor each call.
+        self._pd_train_sq = self._effective_differences(Xn) ** 2
 
         if self.length_scale_ is None:
             self.length_scale_ = np.ones(d)
