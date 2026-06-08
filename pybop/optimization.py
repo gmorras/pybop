@@ -174,8 +174,9 @@ def _compute_r2(X1: np.ndarray, X2: np.ndarray,
     for k in range(X1.shape[1]):
         delta = X1[:, k][:, None] - X2[:, k][None, :]    # (n1, n2)
         if k in per_set:
-            delta = 2.0 * np.sin((np.pi / periods_norm[k]) * delta)
-        delta *= (1./length_scale[k])
+            delta  = (2.0 / length_scale[k]) * np.sin((np.pi / periods_norm[k]) * delta)
+        else:
+            delta *= (1.0 / length_scale[k])
         r2 += delta * delta
     return r2
 
